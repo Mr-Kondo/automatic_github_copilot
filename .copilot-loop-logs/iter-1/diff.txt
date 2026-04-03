@@ -1,0 +1,581 @@
+### git branch --show-current
+feature/logcycle
+
+### git status --short
+ M README.md
+ M copilot-review-loop.zsh
+?? .copilot-loop-logs/
+?? test_app.py
+
+### git diff --stat (tracked unstaged)
+ README.md               |  14 +++
+ copilot-review-loop.zsh | 252 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 264 insertions(+), 2 deletions(-)
+
+### git diff (tracked unstaged)
+diff --git a/README.md b/README.md
+index fe5033b..a04d1f1 100644
+--- a/README.md
++++ b/README.md
+@@ -37,6 +37,8 @@ GitHub Copilot CLI を使って、**実装 → ローカルチェック → レ
+   - `grep`
+   - `date`
+   - `wc`
++  - `stat`
++  - `tail`
+ 
+ また、`copilot` CLI 側で `implementer` / `reviewer` エージェントが使える状態である必要があります。
+ 
+@@ -76,6 +78,12 @@ GitHub Copilot CLI を使って、**実装 → ローカルチェック → レ
+ --lint-cmd CMD                  Lint command (simple argv-style only)
+ --typecheck-cmd CMD             Typecheck command (simple argv-style only)
+ --log-dir DIR                   Log directory (default: .copilot-loop-logs)
++--app-log-dir DIR               Application log directory to read latest from (default: log)
++--app-log-max-lines NUM         Max lines from latest app log to include in prompt (default: 120)
++--log-context-file FILE         Managed markdown context log path (default: .copilot-loop-logs/context.md)
++--log-context-max-bytes NUM     Rotate managed context log when exceeded (default: 262144)
++--log-context-keep NUM          Number of rotated generations to keep (default: 3)
++--no-log-context                Disable app log context injection
+ --implementer-agent NAME        Custom agent name for implementation
+ --reviewer-agent NAME           Custom agent name for review
+ --commit-message MSG            Commit message after PASS
+@@ -121,6 +129,12 @@ $HOME/bin/tool
+ 
+ レビューが `PASS` しない場合は、このディレクトリを見ると原因を追いやすくなります。
+ 
++さらに、既定では `log/` 配下の最新ログファイルを毎イテレーションで探索し、実装プロンプト向けに末尾を抽出して `.copilot-loop-logs/iter-*/latest_app_log_snippet.txt` に保存します。実装エージェントにはこの抽出ファイルのパスが追加コンテキストとして渡されます。
++
++実装・レビュー結果のサマリは管理用 Markdown ログ `.copilot-loop-logs/context.md` に追記されます。このファイルが `--log-context-max-bytes` を超えると、世代管理でローテーションされます（`.1`, `.2`, ...）。保持世代数は `--log-context-keep` で制御できます。
++
++`--no-log-context` を指定すると、上記のログ注入・管理ログ追記は無効化され、従来どおりの動作になります。
++
+ ## 補足
+ 
+ - `task.md` は実装対象の指示書です
+diff --git a/copilot-review-loop.zsh b/copilot-review-loop.zsh
+index cd2bcb3..3c58ddb 100755
+--- a/copilot-review-loop.zsh
++++ b/copilot-review-loop.zsh
+@@ -29,6 +29,12 @@ setopt ERR_EXIT NO_UNSET PIPE_FAIL
+ : "${LINT_CMD:=}"
+ : "${TYPECHECK_CMD:=}"
+ : "${EXTRA_IMPL_INSTR:=}"
++: "${ENABLE_LOG_CONTEXT:=1}"
++: "${APP_LOG_DIR:=log}"
++: "${APP_LOG_MAX_PROMPT_LINES:=120}"
++: "${LOG_CONTEXT_FILE:=.copilot-loop-logs/context.md}"
++: "${LOG_CONTEXT_MAX_BYTES:=262144}"   # 256 KiB
++: "${LOG_CONTEXT_KEEP_GENERATIONS:=3}"
+ 
+ usage() {
+   cat <<'EOF'
+@@ -42,6 +48,12 @@ Options:
+   --lint-cmd CMD                  Lint command (simple argv-style only)
+   --typecheck-cmd CMD             Typecheck command (simple argv-style only)
+   --log-dir DIR                   Log directory (default: .copilot-loop-logs)
++  --app-log-dir DIR               Application log directory to read latest from (default: log)
++  --app-log-max-lines NUM         Max lines from latest app log to include in prompt (default: 120)
++  --log-context-file FILE         Managed markdown context log path (default: .copilot-loop-logs/context.md)
++  --log-context-max-bytes NUM     Rotate managed context log when exceeded (default: 262144)
++  --log-context-keep NUM          Number of rotated generations to keep (default: 3)
++  --no-log-context                Disable app log context injection
+   --implementer-agent NAME        Custom agent name for implementation
+   --reviewer-agent NAME           Custom agent name for review
+   --commit-message MSG            Commit message after PASS
+@@ -263,14 +275,159 @@ summarize_review() {
+   fi
+ }
+ 
++find_latest_app_log() {
++  local log_dir="$1"
++  local latest_file=""
++  local latest_mtime=-1
++  local -a candidates
++  local candidate
++  local mtime
++
++  if [[ ! -d "$log_dir" ]]; then
++    return 0
++  fi
++
++  candidates=("$log_dir"/*(.N))
++  if (( ${#candidates[@]} == 0 )); then
++    return 0
++  fi
++
++  for candidate in "${candidates[@]}"; do
++    mtime="$(stat -f '%m' "$candidate" 2>/dev/null || true)"
++    if [[ "$mtime" == <-> ]] && (( mtime > latest_mtime )); then
++      latest_mtime="$mtime"
++      latest_file="$candidate"
++    fi
++  done
++
++  if [[ -n "$latest_file" ]]; then
++    print -r -- "$latest_file"
++  fi
++}
++
++rotate_managed_context_log() {
++  local context_file="$1"
++  local max_bytes="$2"
++  local keep_generations="$3"
++  local current_size
++  local idx
++  local src
++  local dst
++  local context_dir="${context_file:h}"
++
++  mkdir -p "$context_dir"
++
++  if [[ ! -f "$context_file" ]]; then
++    return 0
++  fi
++
++  current_size="$(wc -c < "$context_file" 2>/dev/null | tr -d '[:space:]' || true)"
++  [[ -z "$current_size" ]] && current_size=0
++
++  if ! [[ "$current_size" == <-> ]]; then
++    return 0
++  fi
++
++  if (( current_size <= max_bytes )); then
++    return 0
++  fi
++
++  if (( keep_generations <= 0 )); then
++    : > "$context_file"
++    return 0
++  fi
++
++  for (( idx = keep_generations; idx >= 1; idx-- )); do
++    dst="$context_file.$idx"
++    if (( idx == keep_generations )) && [[ -f "$dst" ]]; then
++      rm -f -- "$dst"
++    fi
++
++    if (( idx == 1 )); then
++      src="$context_file"
++    else
++      src="$context_file.$((idx - 1))"
++    fi
++
++    if [[ -f "$src" ]]; then
++      mv -f -- "$src" "$dst"
++    fi
++  done
++
++  : > "$context_file"
++}
++
++append_managed_context_log() {
++  local context_file="$1"
++  local app_log_file="$2"
++  local status="$3"
++  local issue_count="$4"
++  local review_json_file="$5"
++
++  rotate_managed_context_log "$context_file" "$LOG_CONTEXT_MAX_BYTES" "$LOG_CONTEXT_KEEP_GENERATIONS"
++
++  {
++    print -- "## $(timestamp)"
++    print -- "status: ${status}, issues: ${issue_count}"
++    if [[ -n "$app_log_file" ]]; then
++      print -- "latest_app_log: ${app_log_file}"
++    else
++      print -- "latest_app_log: (none)"
++    fi
++
++    if [[ -f "$review_json_file" ]]; then
++      print -- ""
++      print -- "### reviewer_findings"
++      jq -r '.issues[]? | "- [\(.severity // \"UNKNOWN\")] \(.file):\(.line // 0) \(.title)"' "$review_json_file" || true
++    fi
++    print -- ""
++  } >> "$context_file"
++}
++
++build_log_context_section() {
++  local app_log_file="$1"
++  local context_file="$2"
++  local has_any=0
++
++  if [[ -n "$app_log_file" && -f "$app_log_file" ]]; then
++    has_any=1
++  fi
++  if [[ -n "$context_file" && -f "$context_file" ]]; then
++    has_any=1
++  fi
++
++  if [[ "$has_any" -ne 1 ]]; then
++    return 0
++  fi
++
++  print -- ""
++  print -- "Additional context files:"
++  if [[ -n "$app_log_file" && -f "$app_log_file" ]]; then
++    print -- "- Latest app run log: ${app_log_file}"
++  fi
++  if [[ -n "$context_file" && -f "$context_file" ]]; then
++    print -- "- Managed implementation context log: ${context_file}"
++  fi
++}
++
+ build_impl_prompt_initial() {
+   local task_file="$1"
++  local app_log_file="$2"
++  local context_file="$3"
++  local log_context_section=""
++
++  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
++    log_context_section="$(build_log_context_section "$app_log_file" "$context_file")"
++  fi
++
+   cat <<EOF
+ Implement the task described in this repository file:
+ - ${task_file}
++${log_context_section}
+ 
+ Instructions:
+ - Read ${task_file} directly from the repository before making changes.
++- Read additional context files when available.
+ - Edit code directly in the working tree.
+ - Keep changes minimal and localized.
+ - Do not modify unrelated files.
+@@ -286,13 +443,23 @@ EOF
+ build_impl_prompt_revision() {
+   local task_file="$1"
+   local review_json_file="$2"
++  local app_log_file="$3"
++  local context_file="$4"
++  local log_context_section=""
++
++  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
++    log_context_section="$(build_log_context_section "$app_log_file" "$context_file")"
++  fi
++
+   cat <<EOF
+ Revise the implementation using these sources:
+ - Task file: ${task_file}
+ - Review findings JSON: ${review_json_file}
++${log_context_section}
+ 
+ Instructions:
+ - Read both files directly before making changes.
++- Read additional context files when available.
+ - Fix every material issue from the review findings.
+ - Keep changes minimal and localized.
+ - Do not modify unrelated files.
+@@ -352,6 +519,12 @@ stage_files_for_commit() {
+     git reset -q HEAD -- "$LOG_DIR" 2>/dev/null || true
+   fi
+ 
++  if [[ -e "$LOG_CONTEXT_FILE" ]]; then
++    git reset -q HEAD -- "$LOG_CONTEXT_FILE" 2>/dev/null || true
++  fi
++
++  git reset -q HEAD -- ":(glob)$LOG_CONTEXT_FILE.*" 2>/dev/null || true
++
+   if [[ "$INCLUDE_TASK_FILE_IN_COMMIT" -ne 1 && -e "$TASK_FILE" ]]; then
+     git reset -q HEAD -- "$TASK_FILE" 2>/dev/null || true
+   fi
+@@ -407,6 +580,30 @@ while [[ $# -gt 0 ]]; do
+       LOG_DIR="$2"
+       shift 2
+       ;;
++    --app-log-dir)
++      APP_LOG_DIR="$2"
++      shift 2
++      ;;
++    --app-log-max-lines)
++      APP_LOG_MAX_PROMPT_LINES="$2"
++      shift 2
++      ;;
++    --log-context-file)
++      LOG_CONTEXT_FILE="$2"
++      shift 2
++      ;;
++    --log-context-max-bytes)
++      LOG_CONTEXT_MAX_BYTES="$2"
++      shift 2
++      ;;
++    --log-context-keep)
++      LOG_CONTEXT_KEEP_GENERATIONS="$2"
++      shift 2
++      ;;
++    --no-log-context)
++      ENABLE_LOG_CONTEXT=0
++      shift 1
++      ;;
+     --implementer-agent)
+       IMPLEMENTER_AGENT="$2"
+       shift 2
+@@ -449,6 +646,8 @@ require_cmd tr
+ require_cmd grep
+ require_cmd date
+ require_cmd wc
++require_cmd stat
++require_cmd tail
+ 
+ if ! [[ "$MAX_ITERS" == <-> ]] || (( MAX_ITERS <= 0 )); then
+   err "MAX_ITERS must be a positive integer, got: $MAX_ITERS"
+@@ -460,6 +659,26 @@ if ! [[ "$UNTRACKED_DIFF_MAX_BYTES" == <-> ]] || (( UNTRACKED_DIFF_MAX_BYTES < 0
+   exit 1
+ fi
+ 
++if ! [[ "$APP_LOG_MAX_PROMPT_LINES" == <-> ]] || (( APP_LOG_MAX_PROMPT_LINES <= 0 )); then
++  err "APP_LOG_MAX_PROMPT_LINES must be a positive integer, got: $APP_LOG_MAX_PROMPT_LINES"
++  exit 1
++fi
++
++if ! [[ "$LOG_CONTEXT_MAX_BYTES" == <-> ]] || (( LOG_CONTEXT_MAX_BYTES < 0 )); then
++  err "LOG_CONTEXT_MAX_BYTES must be a non-negative integer, got: $LOG_CONTEXT_MAX_BYTES"
++  exit 1
++fi
++
++if ! [[ "$LOG_CONTEXT_KEEP_GENERATIONS" == <-> ]] || (( LOG_CONTEXT_KEEP_GENERATIONS < 0 )); then
++  err "LOG_CONTEXT_KEEP_GENERATIONS must be a non-negative integer, got: $LOG_CONTEXT_KEEP_GENERATIONS"
++  exit 1
++fi
++
++if ! [[ "$ENABLE_LOG_CONTEXT" == <-> ]] || (( ENABLE_LOG_CONTEXT != 0 && ENABLE_LOG_CONTEXT != 1 )); then
++  err "ENABLE_LOG_CONTEXT must be 0 or 1, got: $ENABLE_LOG_CONTEXT"
++  exit 1
++fi
++
+ LOG_DIR="${LOG_DIR%/}"
+ case "$LOG_DIR" in
+   ./*)
+@@ -470,6 +689,10 @@ case "$LOG_DIR" in
+     ;;
+ esac
+ 
++if [[ "$LOG_CONTEXT_FILE" == ".copilot-loop-logs/context.md" && "$LOG_DIR" != ".copilot-loop-logs" ]]; then
++  LOG_CONTEXT_FILE="$LOG_DIR/context.md"
++fi
++
+ [[ -f "$TASK_FILE" ]] || {
+   err "Task file not found: $TASK_FILE"
+   exit 1
+@@ -495,6 +718,12 @@ log "Max iterations: $MAX_ITERS"
+ log "Log dir: $LOG_DIR"
+ log "Log dir filter: $LOG_DIR_FILTER"
+ log "Untracked diff size limit: $UNTRACKED_DIFF_MAX_BYTES bytes"
++log "Log context enabled: $ENABLE_LOG_CONTEXT"
++log "App log dir: $APP_LOG_DIR"
++log "App log lines for prompt: $APP_LOG_MAX_PROMPT_LINES"
++log "Managed context log file: $LOG_CONTEXT_FILE"
++log "Managed context log rotate bytes: $LOG_CONTEXT_MAX_BYTES"
++log "Managed context log generations: $LOG_CONTEXT_KEEP_GENERATIONS"
+ log "Implementer agent: $IMPLEMENTER_AGENT"
+ log "Reviewer agent: $REVIEWER_AGENT"
+ log "Auto commit: $AUTO_COMMIT"
+@@ -518,12 +747,27 @@ for (( iter = 1; iter <= MAX_ITERS; iter++ )); do
+ 
+   local_impl_prompt=""
+   local_review_prompt=""
++  latest_app_log_file=""
++  latest_app_log_for_prompt=""
++
++  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
++    latest_app_log_file="$(find_latest_app_log "$APP_LOG_DIR")"
++    if [[ -n "$latest_app_log_file" ]]; then
++      latest_app_log_for_prompt="$ITER_DIR/latest_app_log_snippet.txt"
++      {
++        print -- "# source: ${latest_app_log_file}"
++        print -- "# captured_at: $(timestamp)"
++        print -- ""
++        tail -n "$APP_LOG_MAX_PROMPT_LINES" "$latest_app_log_file" || true
++      } > "$latest_app_log_for_prompt"
++    fi
++  fi
+ 
+   if [[ -z "$REVIEW_JSON" ]]; then
+-    local_impl_prompt="$(build_impl_prompt_initial "$TASK_FILE")"
++    local_impl_prompt="$(build_impl_prompt_initial "$TASK_FILE" "$latest_app_log_for_prompt" "$LOG_CONTEXT_FILE")"
+   else
+     print -r -- "$REVIEW_JSON" > "$REVIEW_JSON_FILE"
+-    local_impl_prompt="$(build_impl_prompt_revision "$TASK_FILE" "$REVIEW_JSON_FILE")"
++    local_impl_prompt="$(build_impl_prompt_revision "$TASK_FILE" "$REVIEW_JSON_FILE" "$latest_app_log_for_prompt" "$LOG_CONTEXT_FILE")"
+   fi
+   print -r -- "$local_impl_prompt" > "$IMPL_PROMPT_FILE"
+ 
+@@ -617,6 +861,10 @@ PY
+   STATUS="$(jq -r '.status' "$REVIEW_JSON_FILE")"
+   ISSUE_COUNT="$(jq -r '.issues | length' "$REVIEW_JSON_FILE")"
+ 
++  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
++    append_managed_context_log "$LOG_CONTEXT_FILE" "$latest_app_log_file" "$STATUS" "$ISSUE_COUNT" "$REVIEW_JSON_FILE"
++  fi
++
+   if [[ "$STATUS" == "PASS" && "$ISSUE_COUNT" -eq 0 ]]; then
+     PASS_FLAG=1
+     log "Review passed with zero findings."
+
+### git diff --cached (staged)
+
+### untracked files (LOG_DIR excluded)
+test_app.py
+
+### git diff for untracked files
+--- test_app.py
+diff --git a/test_app.py b/test_app.py
+new file mode 100644
+index 0000000..a185733
+--- /dev/null
++++ b/test_app.py
+@@ -0,0 +1,153 @@
++import pytest
++
++from app import MIN_PASSWORD_LENGTH, _users, app
++
++
++@pytest.fixture(autouse=True)
++def clear_users():
++    """Reset in-memory user store before each test."""
++    _users.clear()
++    yield
++    _users.clear()
++
++
++@pytest.fixture()
++def client():
++    app.config["TESTING"] = True
++    with app.test_client() as c:
++        yield c
++
++
++# ---------------------------------------------------------------------------
++# Happy path
++# ---------------------------------------------------------------------------
++
++
++def test_register_success(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": "a" * MIN_PASSWORD_LENGTH},
++    )
++    assert resp.status_code == 201
++    assert resp.get_json()["message"] == "User registered successfully"
++
++
++def test_register_password_exactly_min_length(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": "x" * MIN_PASSWORD_LENGTH},
++    )
++    assert resp.status_code == 201
++
++
++# ---------------------------------------------------------------------------
++# Email validation
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "bad_email",
++    [
++        "not-an-email",
++        "missing@tld",
++        "@nodomain.com",
++        "spaces in@email.com",
++        "",
++        "double@@domain.com",
++        None,
++        123,
++    ],
++)
++def test_invalid_email_returns_400(client, bad_email):
++    resp = client.post(
++        "/register",
++        json={"email": bad_email, "password": "a" * MIN_PASSWORD_LENGTH},
++    )
++    assert resp.status_code == 400
++    assert "email" in resp.get_json()["error"].lower()
++
++
++# ---------------------------------------------------------------------------
++# Password validation
++# ---------------------------------------------------------------------------
++
++
++def test_password_too_short_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": "short"},
++    )
++    assert resp.status_code == 400
++    assert "password" in resp.get_json()["error"].lower()
++
++
++def test_password_one_char_below_minimum_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": "x" * (MIN_PASSWORD_LENGTH - 1)},
++    )
++    assert resp.status_code == 400
++
++
++def test_password_none_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": None},
++    )
++    assert resp.status_code == 400
++
++
++def test_password_integer_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com", "password": 123456789012},
++    )
++    assert resp.status_code == 400
++
++
++# ---------------------------------------------------------------------------
++# Malformed request body
++# ---------------------------------------------------------------------------
++
++
++def test_non_json_body_returns_400(client):
++    resp = client.post(
++        "/register",
++        data="not json",
++        content_type="text/plain",
++    )
++    assert resp.status_code == 400
++
++
++def test_json_array_body_returns_400(client):
++    resp = client.post("/register", json=[{"email": "user@example.com"}])
++    assert resp.status_code == 400
++
++
++def test_missing_email_field_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"password": "a" * MIN_PASSWORD_LENGTH},
++    )
++    assert resp.status_code == 400
++
++
++def test_missing_password_field_returns_400(client):
++    resp = client.post(
++        "/register",
++        json={"email": "user@example.com"},
++    )
++    assert resp.status_code == 400
++
++
++# ---------------------------------------------------------------------------
++# Duplicate email
++# ---------------------------------------------------------------------------
++
++
++def test_duplicate_email_returns_409(client):
++    payload = {"email": "dup@example.com", "password": "a" * MIN_PASSWORD_LENGTH}
++    client.post("/register", json=payload)
++    resp = client.post("/register", json=payload)
++    assert resp.status_code == 409
++    assert "already" in resp.get_json()["error"].lower()
+

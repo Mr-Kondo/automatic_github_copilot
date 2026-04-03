@@ -1,0 +1,21 @@
+{
+  "status": "FAIL",
+  "issues": [
+    {
+      "severity": "high",
+      "file": "copilot-review-loop.zsh",
+      "line": 32,
+      "title": "Unrelated loop-script feature added in task change",
+      "detail": "The task is limited to strengthening the user registration API and adding/updating pytest coverage, but this patch adds a large new log-context/app-log feature to the review loop script, including new flags, file rotation, prompt wiring, and staging behavior. That is unrelated to /register validation, violates the requirement to keep changes localized, and significantly increases the review and regression surface for this task.",
+      "suggested_fix": "Remove the copilot-review-loop.zsh changes from this task and submit only the registration API/test edits needed for /register validation."
+    },
+    {
+      "severity": "low",
+      "file": "README.md",
+      "line": 81,
+      "title": "Documentation updated for unrelated CLI options",
+      "detail": "The README additions document the new log-context CLI behavior, which is unrelated to the registration-validation task. Keeping unrelated documentation changes in the same submission conflicts with the task requirement to avoid unrelated file changes.",
+      "suggested_fix": "Revert the README additions here, or land them separately with the loop-script feature they document."
+    }
+  ]
+}
