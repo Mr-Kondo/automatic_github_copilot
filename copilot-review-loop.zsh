@@ -29,6 +29,12 @@ setopt ERR_EXIT NO_UNSET PIPE_FAIL
 : "${LINT_CMD:=}"
 : "${TYPECHECK_CMD:=}"
 : "${EXTRA_IMPL_INSTR:=}"
+: "${ENABLE_LOG_CONTEXT:=1}"
+: "${APP_LOG_DIR:=log}"
+: "${APP_LOG_MAX_PROMPT_LINES:=120}"
+: "${LOG_CONTEXT_FILE:=.copilot-loop-logs/context.md}"
+: "${LOG_CONTEXT_MAX_BYTES:=262144}"   # 256 KiB
+: "${LOG_CONTEXT_KEEP_GENERATIONS:=3}"
 
 usage() {
   cat <<'EOF'
@@ -42,6 +48,12 @@ Options:
   --lint-cmd CMD                  Lint command (simple argv-style only)
   --typecheck-cmd CMD             Typecheck command (simple argv-style only)
   --log-dir DIR                   Log directory (default: .copilot-loop-logs)
+  --app-log-dir DIR               Application log directory to read latest from (default: log)
+  --app-log-max-lines NUM         Max lines from latest app log to include in prompt (default: 120)
+  --log-context-file FILE         Managed markdown context log path (default: .copilot-loop-logs/context.md)
+  --log-context-max-bytes NUM     Rotate managed context log when exceeded (default: 262144)
+  --log-context-keep NUM          Number of rotated generations to keep (default: 3)
+  --no-log-context                Disable app log context injection
   --implementer-agent NAME        Custom agent name for implementation
   --reviewer-agent NAME           Custom agent name for review
   --commit-message MSG            Commit message after PASS
@@ -263,14 +275,159 @@ summarize_review() {
   fi
 }
 
+find_latest_app_log() {
+  local log_dir="$1"
+  local latest_file=""
+  local latest_mtime=-1
+  local -a candidates
+  local candidate
+  local mtime
+
+  if [[ ! -d "$log_dir" ]]; then
+    return 0
+  fi
+
+  candidates=("$log_dir"/*(.N))
+  if (( ${#candidates[@]} == 0 )); then
+    return 0
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    mtime="$(stat -f '%m' "$candidate" 2>/dev/null || true)"
+    if [[ "$mtime" == <-> ]] && (( mtime > latest_mtime )); then
+      latest_mtime="$mtime"
+      latest_file="$candidate"
+    fi
+  done
+
+  if [[ -n "$latest_file" ]]; then
+    print -r -- "$latest_file"
+  fi
+}
+
+rotate_managed_context_log() {
+  local context_file="$1"
+  local max_bytes="$2"
+  local keep_generations="$3"
+  local current_size
+  local idx
+  local src
+  local dst
+  local context_dir="${context_file:h}"
+
+  mkdir -p "$context_dir"
+
+  if [[ ! -f "$context_file" ]]; then
+    return 0
+  fi
+
+  current_size="$(wc -c < "$context_file" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -z "$current_size" ]] && current_size=0
+
+  if ! [[ "$current_size" == <-> ]]; then
+    return 0
+  fi
+
+  if (( current_size <= max_bytes )); then
+    return 0
+  fi
+
+  if (( keep_generations <= 0 )); then
+    : > "$context_file"
+    return 0
+  fi
+
+  for (( idx = keep_generations; idx >= 1; idx-- )); do
+    dst="$context_file.$idx"
+    if (( idx == keep_generations )) && [[ -f "$dst" ]]; then
+      rm -f -- "$dst"
+    fi
+
+    if (( idx == 1 )); then
+      src="$context_file"
+    else
+      src="$context_file.$((idx - 1))"
+    fi
+
+    if [[ -f "$src" ]]; then
+      mv -f -- "$src" "$dst"
+    fi
+  done
+
+  : > "$context_file"
+}
+
+append_managed_context_log() {
+  local context_file="$1"
+  local app_log_file="$2"
+  local status="$3"
+  local issue_count="$4"
+  local review_json_file="$5"
+
+  rotate_managed_context_log "$context_file" "$LOG_CONTEXT_MAX_BYTES" "$LOG_CONTEXT_KEEP_GENERATIONS"
+
+  {
+    print -- "## $(timestamp)"
+    print -- "status: ${status}, issues: ${issue_count}"
+    if [[ -n "$app_log_file" ]]; then
+      print -- "latest_app_log: ${app_log_file}"
+    else
+      print -- "latest_app_log: (none)"
+    fi
+
+    if [[ -f "$review_json_file" ]]; then
+      print -- ""
+      print -- "### reviewer_findings"
+      jq -r '.issues[]? | "- [\(.severity // \"UNKNOWN\")] \(.file):\(.line // 0) \(.title)"' "$review_json_file" || true
+    fi
+    print -- ""
+  } >> "$context_file"
+}
+
+build_log_context_section() {
+  local app_log_file="$1"
+  local context_file="$2"
+  local has_any=0
+
+  if [[ -n "$app_log_file" && -f "$app_log_file" ]]; then
+    has_any=1
+  fi
+  if [[ -n "$context_file" && -f "$context_file" ]]; then
+    has_any=1
+  fi
+
+  if [[ "$has_any" -ne 1 ]]; then
+    return 0
+  fi
+
+  print -- ""
+  print -- "Additional context files:"
+  if [[ -n "$app_log_file" && -f "$app_log_file" ]]; then
+    print -- "- Latest app run log: ${app_log_file}"
+  fi
+  if [[ -n "$context_file" && -f "$context_file" ]]; then
+    print -- "- Managed implementation context log: ${context_file}"
+  fi
+}
+
 build_impl_prompt_initial() {
   local task_file="$1"
+  local app_log_file="$2"
+  local context_file="$3"
+  local log_context_section=""
+
+  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
+    log_context_section="$(build_log_context_section "$app_log_file" "$context_file")"
+  fi
+
   cat <<EOF
 Implement the task described in this repository file:
 - ${task_file}
+${log_context_section}
 
 Instructions:
 - Read ${task_file} directly from the repository before making changes.
+- Read additional context files when available.
 - Edit code directly in the working tree.
 - Keep changes minimal and localized.
 - Do not modify unrelated files.
@@ -286,13 +443,23 @@ EOF
 build_impl_prompt_revision() {
   local task_file="$1"
   local review_json_file="$2"
+  local app_log_file="$3"
+  local context_file="$4"
+  local log_context_section=""
+
+  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
+    log_context_section="$(build_log_context_section "$app_log_file" "$context_file")"
+  fi
+
   cat <<EOF
 Revise the implementation using these sources:
 - Task file: ${task_file}
 - Review findings JSON: ${review_json_file}
+${log_context_section}
 
 Instructions:
 - Read both files directly before making changes.
+- Read additional context files when available.
 - Fix every material issue from the review findings.
 - Keep changes minimal and localized.
 - Do not modify unrelated files.
@@ -352,6 +519,12 @@ stage_files_for_commit() {
     git reset -q HEAD -- "$LOG_DIR" 2>/dev/null || true
   fi
 
+  if [[ -e "$LOG_CONTEXT_FILE" ]]; then
+    git reset -q HEAD -- "$LOG_CONTEXT_FILE" 2>/dev/null || true
+  fi
+
+  git reset -q HEAD -- ":(glob)$LOG_CONTEXT_FILE.*" 2>/dev/null || true
+
   if [[ "$INCLUDE_TASK_FILE_IN_COMMIT" -ne 1 && -e "$TASK_FILE" ]]; then
     git reset -q HEAD -- "$TASK_FILE" 2>/dev/null || true
   fi
@@ -407,6 +580,30 @@ while [[ $# -gt 0 ]]; do
       LOG_DIR="$2"
       shift 2
       ;;
+    --app-log-dir)
+      APP_LOG_DIR="$2"
+      shift 2
+      ;;
+    --app-log-max-lines)
+      APP_LOG_MAX_PROMPT_LINES="$2"
+      shift 2
+      ;;
+    --log-context-file)
+      LOG_CONTEXT_FILE="$2"
+      shift 2
+      ;;
+    --log-context-max-bytes)
+      LOG_CONTEXT_MAX_BYTES="$2"
+      shift 2
+      ;;
+    --log-context-keep)
+      LOG_CONTEXT_KEEP_GENERATIONS="$2"
+      shift 2
+      ;;
+    --no-log-context)
+      ENABLE_LOG_CONTEXT=0
+      shift 1
+      ;;
     --implementer-agent)
       IMPLEMENTER_AGENT="$2"
       shift 2
@@ -449,6 +646,8 @@ require_cmd tr
 require_cmd grep
 require_cmd date
 require_cmd wc
+require_cmd stat
+require_cmd tail
 
 if ! [[ "$MAX_ITERS" == <-> ]] || (( MAX_ITERS <= 0 )); then
   err "MAX_ITERS must be a positive integer, got: $MAX_ITERS"
@@ -457,6 +656,26 @@ fi
 
 if ! [[ "$UNTRACKED_DIFF_MAX_BYTES" == <-> ]] || (( UNTRACKED_DIFF_MAX_BYTES < 0 )); then
   err "UNTRACKED_DIFF_MAX_BYTES must be a non-negative integer, got: $UNTRACKED_DIFF_MAX_BYTES"
+  exit 1
+fi
+
+if ! [[ "$APP_LOG_MAX_PROMPT_LINES" == <-> ]] || (( APP_LOG_MAX_PROMPT_LINES <= 0 )); then
+  err "APP_LOG_MAX_PROMPT_LINES must be a positive integer, got: $APP_LOG_MAX_PROMPT_LINES"
+  exit 1
+fi
+
+if ! [[ "$LOG_CONTEXT_MAX_BYTES" == <-> ]] || (( LOG_CONTEXT_MAX_BYTES < 0 )); then
+  err "LOG_CONTEXT_MAX_BYTES must be a non-negative integer, got: $LOG_CONTEXT_MAX_BYTES"
+  exit 1
+fi
+
+if ! [[ "$LOG_CONTEXT_KEEP_GENERATIONS" == <-> ]] || (( LOG_CONTEXT_KEEP_GENERATIONS < 0 )); then
+  err "LOG_CONTEXT_KEEP_GENERATIONS must be a non-negative integer, got: $LOG_CONTEXT_KEEP_GENERATIONS"
+  exit 1
+fi
+
+if ! [[ "$ENABLE_LOG_CONTEXT" == <-> ]] || (( ENABLE_LOG_CONTEXT != 0 && ENABLE_LOG_CONTEXT != 1 )); then
+  err "ENABLE_LOG_CONTEXT must be 0 or 1, got: $ENABLE_LOG_CONTEXT"
   exit 1
 fi
 
@@ -469,6 +688,10 @@ case "$LOG_DIR" in
     LOG_DIR_FILTER="$LOG_DIR"
     ;;
 esac
+
+if [[ "$LOG_CONTEXT_FILE" == ".copilot-loop-logs/context.md" && "$LOG_DIR" != ".copilot-loop-logs" ]]; then
+  LOG_CONTEXT_FILE="$LOG_DIR/context.md"
+fi
 
 [[ -f "$TASK_FILE" ]] || {
   err "Task file not found: $TASK_FILE"
@@ -495,6 +718,12 @@ log "Max iterations: $MAX_ITERS"
 log "Log dir: $LOG_DIR"
 log "Log dir filter: $LOG_DIR_FILTER"
 log "Untracked diff size limit: $UNTRACKED_DIFF_MAX_BYTES bytes"
+log "Log context enabled: $ENABLE_LOG_CONTEXT"
+log "App log dir: $APP_LOG_DIR"
+log "App log lines for prompt: $APP_LOG_MAX_PROMPT_LINES"
+log "Managed context log file: $LOG_CONTEXT_FILE"
+log "Managed context log rotate bytes: $LOG_CONTEXT_MAX_BYTES"
+log "Managed context log generations: $LOG_CONTEXT_KEEP_GENERATIONS"
 log "Implementer agent: $IMPLEMENTER_AGENT"
 log "Reviewer agent: $REVIEWER_AGENT"
 log "Auto commit: $AUTO_COMMIT"
@@ -518,12 +747,27 @@ for (( iter = 1; iter <= MAX_ITERS; iter++ )); do
 
   local_impl_prompt=""
   local_review_prompt=""
+  latest_app_log_file=""
+  latest_app_log_for_prompt=""
+
+  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
+    latest_app_log_file="$(find_latest_app_log "$APP_LOG_DIR")"
+    if [[ -n "$latest_app_log_file" ]]; then
+      latest_app_log_for_prompt="$ITER_DIR/latest_app_log_snippet.txt"
+      {
+        print -- "# source: ${latest_app_log_file}"
+        print -- "# captured_at: $(timestamp)"
+        print -- ""
+        tail -n "$APP_LOG_MAX_PROMPT_LINES" "$latest_app_log_file" || true
+      } > "$latest_app_log_for_prompt"
+    fi
+  fi
 
   if [[ -z "$REVIEW_JSON" ]]; then
-    local_impl_prompt="$(build_impl_prompt_initial "$TASK_FILE")"
+    local_impl_prompt="$(build_impl_prompt_initial "$TASK_FILE" "$latest_app_log_for_prompt" "$LOG_CONTEXT_FILE")"
   else
     print -r -- "$REVIEW_JSON" > "$REVIEW_JSON_FILE"
-    local_impl_prompt="$(build_impl_prompt_revision "$TASK_FILE" "$REVIEW_JSON_FILE")"
+    local_impl_prompt="$(build_impl_prompt_revision "$TASK_FILE" "$REVIEW_JSON_FILE" "$latest_app_log_for_prompt" "$LOG_CONTEXT_FILE")"
   fi
   print -r -- "$local_impl_prompt" > "$IMPL_PROMPT_FILE"
 
@@ -616,6 +860,10 @@ PY
 
   STATUS="$(jq -r '.status' "$REVIEW_JSON_FILE")"
   ISSUE_COUNT="$(jq -r '.issues | length' "$REVIEW_JSON_FILE")"
+
+  if [[ "$ENABLE_LOG_CONTEXT" -eq 1 ]]; then
+    append_managed_context_log "$LOG_CONTEXT_FILE" "$latest_app_log_file" "$STATUS" "$ISSUE_COUNT" "$REVIEW_JSON_FILE"
+  fi
 
   if [[ "$STATUS" == "PASS" && "$ISSUE_COUNT" -eq 0 ]]; then
     PASS_FLAG=1
