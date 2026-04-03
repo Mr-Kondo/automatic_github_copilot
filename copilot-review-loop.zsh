@@ -122,7 +122,7 @@ git_diff_file() {
   local raw_untracked=""
   local -a candidate_untracked
   local -a untracked_files
-  local path
+  local file_path
   local fsize
   local log_dir_filter_local="$LOG_DIR_FILTER"
 
@@ -135,13 +135,13 @@ git_diff_file() {
   fi
 
   untracked_files=()
-  for path in "${candidate_untracked[@]}"; do
+  for file_path in "${candidate_untracked[@]}"; do
     if [[ -n "$log_dir_filter_local" ]]; then
-      if [[ "$path" == "$log_dir_filter_local" || "$path" == "$log_dir_filter_local/"* ]]; then
+      if [[ "$file_path" == "$log_dir_filter_local" || "$file_path" == "$log_dir_filter_local/"* ]]; then
         continue
       fi
     fi
-    untracked_files+=("$path")
+    untracked_files+=("$file_path")
   done
 
   {
@@ -175,19 +175,19 @@ git_diff_file() {
 
     print -- "### git diff for untracked files"
     if (( ${#untracked_files[@]} > 0 )); then
-      for path in "${untracked_files[@]}"; do
-        if [[ -f "$path" ]]; then
-          fsize="$(wc -c < "$path" 2>/dev/null | tr -d '[:space:]' || true)"
+      for file_path in "${untracked_files[@]}"; do
+        if [[ -f "$file_path" ]]; then
+          fsize="$(wc -c < "$file_path" 2>/dev/null | tr -d '[:space:]' || true)"
           [[ -z "$fsize" ]] && fsize=0
           if [[ "$fsize" == <-> ]] && (( fsize > UNTRACKED_DIFF_MAX_BYTES )); then
-            print -- "--- $path (skipped: file too large, ${fsize} bytes)"
+            print -- "--- $file_path (skipped: file too large, ${fsize} bytes)"
             print
             continue
           fi
         fi
 
-        print -- "--- $path"
-        git diff --no-index -- /dev/null "$path" || true
+        print -- "--- $file_path"
+        git diff --no-index -- /dev/null "$file_path" || true
         print
       done
     else
@@ -578,12 +578,15 @@ text = open(src, "r", encoding="utf-8", errors="ignore").read()
 
 decoder = json.JSONDecoder()
 best = None
+best_end = -1
 for i, ch in enumerate(text):
     if ch != "{":
         continue
     try:
         obj, end = decoder.raw_decode(text[i:])
-        best = obj
+        if end > best_end:
+            best = obj
+            best_end = end
     except Exception:
         pass
 
